@@ -73,6 +73,12 @@ class Command(BaseCommand):
             print(follower_id)
 
             if is_following_me(follower_id):
+                # ToDo: update user info
+                account = get_account_model(follower_id)
+                if account is not None:
+                    account.unfollow_datetime = None
+                    account.save()
+
                 continue
 
             try:
