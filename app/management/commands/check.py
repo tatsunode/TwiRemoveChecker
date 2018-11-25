@@ -21,6 +21,7 @@ class Command(BaseCommand):
         self.twitter_session = None
         self.api_limit_id = 15 
         self.api_limit_user = 900
+        self.api_limit_dm = 1
 
         # make sesison
         CK, CS, AT, ATS = self.load_keys()
@@ -30,11 +31,7 @@ class Command(BaseCommand):
 
         # get current(old) user id list from db & new user id list from api
         old_id_list = self.get_old_id_list()
-        # new_id_list = self.get_follower_id_list()
-        new_id_list = [72326623, 3321361, 2827937894]
-
-        print("OLD IDs:", old_id_list)
-        print("NEW IDs:", new_id_list)
+        new_id_list = self.get_follower_id_list()
 
         # find removed user & new user
         removed_id_list = list(set(old_id_list) - set(new_id_list))
@@ -75,6 +72,10 @@ class Command(BaseCommand):
         return old_id_list
 
     def get_follower_id_list(self):
+
+        if self.api_limit_id <= 0:
+            raise RateLimitError
+
         endpoint = "https://api.twitter.com/1.1/followers/ids.json"
         params = {}
         res = self.twitter_session.get(endpoint, params=params)
@@ -86,11 +87,16 @@ class Command(BaseCommand):
             self.api_limit_id = int(res.headers["x-rate-limit-remaining"])
             return id_list
         elif res.status_code == 429:
+            self.api_limit_id = 0
             raise RateLimitError
         else:
             raise ValueError("API failed: status code: " + str(res.statsu_code))
 
     def get_user_profile(self, user_id):
+
+        if self.api_limit_user <= 0:
+            raise RateLimitError
+
         endpoint = "https://api.twitter.com/1.1/users/show.json"
         params = {
             "user_id": user_id
@@ -102,6 +108,7 @@ class Command(BaseCommand):
             self.api_limit_user = int(res.headers["x-rate-limit-remaining"])
             return response
         elif res.status_code == 429:
+            self.api_limit_user = 0
             raise RateLimitError
         elif res.status_code == 404:
             raise AccountNotFoundError
@@ -109,7 +116,6 @@ class Command(BaseCommand):
             raise ValueError("API failed: status code: " + str(res.statsu_code))
 
     def handle_removed_accounts(self, removed_id_list):
-        print("REMOVED:", removed_id_list)
 
         for removed_user_id in removed_id_list:
             removed_account = Account.objects.get(user_id=removed_user_id)
@@ -122,10 +128,12 @@ class Command(BaseCommand):
                 removed_account.screen_name,
                 removed_account.screen_name
             )
-            self.post_direct_message(message)
+            try:
+                self.post_direct_message(message)
+            except RateLimitError:
+                continue
 
     def handle_new_accounts(self, new_id_list):
-        print("NEW:", new_id_list)
 
         for new_user_id in new_id_list:
             new_account, is_created = Account.objects.get_or_create(user_id=new_user_id)
@@ -175,6 +183,10 @@ class Command(BaseCommand):
                 break
 
     def post_direct_message(self, message):
+
+        if self.api_limit_dm <= 0:
+            raise RateLimitError
+
         endpoint = "https://api.twitter.com/1.1/direct_messages/events/new.json"
         data = {
             "event": {
@@ -195,8 +207,9 @@ class Command(BaseCommand):
         res = self.twitter_session.post(endpoint, json=data, headers=headers)
 
         if res.status_code == 200:
-            pass
+            self.api_limit_dm = int(res.headers["x-rate-limit-remaining"])
         elif res.status_code == 429:
+            self.api_limit_dm = 0
             raise RateLimitError
         else:
             raise ValueError("API failed: status code: " + str(res.status_code))
