@@ -1,31 +1,15 @@
 # -*- coding: utf-8 -*-
-import tweepy, os, datetime, time, sys
+import os, datetime, time, sys
 from pytz import timezone
 from django.core.management.base import BaseCommand
 from app.models import Account, Key
+from requests_oauthlib import OAuth1Session
 
-def get_account_model(account_id):
+class RateLimitError(Exception):
+    """ """
 
-    try:
-        account = Account.objects.get(account_id=account_id)
-        return account
-    
-    except Account.DoesNotExist:
-        return None
-
-
-def is_following_me(account_id):
-    
-    account = get_account_model(account_id) 
-    if account is None:
-        return False
-
-    elif not account.followed_you: 
-        return False
-
-    elif account.followed_you:
-        return True
-
+class AccountNotFoundError(Exception):
+    """ """
 
 def send_dm(api, my_account, account, is_new_user):
 
@@ -41,111 +25,124 @@ def send_dm(api, my_account, account, is_new_user):
 class Command(BaseCommand):
 
     def handle(self, *args, **options):
-        
-        access_keys = self.get_keys()
-        
-        if len(access_keys) != 4:
-            print("No Access Keys", file=sys.stderr)
-            return
-        print(access_keys)
 
-        consumer_key = str(access_keys[0])
-        consumer_secret = str(access_keys[1])
-        access_token = str(access_keys[2])
-        access_token_secret = str(access_keys[3])
+        self.twitter_session = None
+        self.api_limit_id = 15 
+        self.api_limit_user = 900
 
-        print(consumer_key, consumer_secret, access_token, access_token_secret)
-        
-        auth = tweepy.OAuthHandler(consumer_key, consumer_secret)
-        auth.set_access_token(access_token, access_token_secret)
-        api = tweepy.API(auth)
+        CK, CS, AT, ATS = self.get_keys()
+        self.make_twitter_session(CK, CS, AT, ATS)
 
-        my_account = api.me()
+        # get current(old) user id list from db & new user id list from api
+        old_id_list = self.get_old_id_list()
+        # new_id_list = self.get_follower_id_list()
+        new_id_list = [1000, 3000, 4000]
 
-        try:
-            follower_id_list = api.followers_ids()
-        except tweepy.error.TweepError:
-            print("tweepy: id list fetch error")
-            return
+        print("OLD IDs:", old_id_list)
+        print("NEW IDs:", new_id_list)
 
-        # find new account
-        for follower_id in follower_id_list:
-            print(follower_id)
+        # find removed user & new user
+        removed_id_list = list(set(old_id_list) - set(new_id_list))
+        new_id_list = list(set(new_id_list) - set(old_id_list))
 
-            if is_following_me(follower_id):
-                # ToDo: update user info
-                account = get_account_model(follower_id)
-                if account is not None:
-                    account.unfollow_datetime = None
-                    account.save()
+        self.handle_removed_accounts(removed_id_list)
+        self.handle_new_accounts(new_id_list)
 
-                continue
+        self.send_direct_message()
 
-            try:
-                follower = api.get_user(follower_id)
-            except tweepy.error.TweepError:
-                print("tweepy: user fetch error")
-                return
+        self.update_user_profiles()
 
-            screen_name = follower.screen_name
-            name = follower.name
-            description = follower.description
-            created_at = follower.created_at
-
-            print("new follower", follower_id, name, screen_name, description)
-
-            account = get_account_model(follower_id)
-            if account is None:
-                # new follower
-                follow_datetime = datetime.datetime.now(timezone('Asia/Tokyo'))
-                account = Account(
-                    followed_you=True,
-                    follow_datetime=follow_datetime,
-                    screen_name=screen_name,
-                    account_id=follower_id,
-                    name = name,
-                    description=description,
-                    created_at=created_at
-                )
-                account.save()
-
-            else:
-                # old follower
-                account.followed_you = True
-                account.screen_name = screen_name
-                account.name = name
-                account.description = description
-                account.save()
-
-            send_dm(api, my_account, account, is_new_user=True)
-
-        # find remover
-        for account in list(Account.objects.filter(followed_you=True)):
-            print(account.account_id)
-            if int(account.account_id) in follower_id_list:
-                account.followed_you = True
-                account.save()
-                continue
-
-            # removed follower
-            account.unfollow_datetime = datetime.datetime.now(timezone('Asia/Tokyo'))
-            account.followed_you = False
-            account.save()
-
-            send_dm(api, my_account, account, is_new_user=False)
-
-            print("removed follower", account.account_id, account.name, account.screen_name, account.description)
-
+        return
 
     def get_keys(self):
+        CK = str(Key.objects.get(key='consumer_key').value)
+        CS = str(Key.objects.get(key='consumer_secret').value)
+        AT = str(Key.objects.get(key='access_token').value)
+        ATS = str(Key.objects.get(key='access_token_secret').value)
+        return CK, CS, AT, ATS
 
-        try:
-            consumer_key = Key.objects.get(key='consumer_key').value
-            consumer_secret = Key.objects.get(key='consumer_secret').value
-            access_token = Key.objects.get(key='access_token').value
-            access_token_secret = Key.objects.get(key='access_token_secret').value
+    def make_twitter_session(self, CK, CS, AT, ATS):
+        oauth_session = OAuth1Session(CK, CS, AT, ATS)
+        self.twitter_session = oauth_session
 
-            return [consumer_key, consumer_secret, access_token, access_token_secret]
-        
-        except Key.DoesNotExist:
-            return []
+    def get_old_id_list(self):
+        following_accounts = Account.objects.filter(followed_you=True)
+        old_id_list = [ int(account.user_id) for account in following_accounts ]
+        return old_id_list
+
+    def get_follower_id_list(self):
+        endpoint = "https://api.twitter.com/1.1/followers/ids.json"
+        params = {}
+        res = self.twitter_session.get(endpoint, params=params)
+
+        # ToDo: Cursor対応, 5000超えたら
+        if res.status_code == 200:
+            response_json = json.loads(res.text)
+            self.id_list = response_json["ids"]
+            self.limit = int(res.headers["x-rate-limit-remaining"])
+        elif res.status_code == 429:
+            raise RateLimitError
+        else:
+            raise ValueError("API failed: status code: " + str(res.statsu_code))
+
+    def get_user_profile(self, user_id):
+        endpoint = "https://api.twitter.com/1.1/users/show.json"
+        params = {
+            "user_id": user_id
+        }
+        res = twitter.get(endpoint, params=params)
+
+        if res.status_code == 200:
+            response = json.loads(res.text)
+            self.api_limit_user = int(res.headers["x-rate-limit-remaining"])
+            return response
+        elif res.status_code == 429:
+            raise RateLimitError
+        elif res.status_code == 404:
+            raise AccountNotFoundError
+        else:
+            raise ValueError("API failed: status code: " + str(res.statsu_code))
+
+    def handle_removed_accounts(self, removed_id_list):
+        print("REMOVED:", removed_id_list)
+
+        for removed_user_id in removed_id_list:
+            removed_account = Account.objects.get(user_id=removed_user_id)
+            removed_account.followed_you = False
+            removed_account.unfollow_datetime = datetime.datetime.now(timezone('Asia/Tokyo'))
+            removed_account.save()
+
+    def handle_new_accounts(self, new_id_list):
+        print("NEW:", new_id_list)
+
+        for new_user_id in new_id_list:
+            new_account, is_created = Account.objects.get_or_create(user_id=new_user_id)
+            new_account.followed_you = True
+            new_account.follow_datetime = datetime.datetime.now(timezone('Asia/Tokyo'))
+            new_account.save()
+
+            try:
+                self.update_user_profile(new_account)
+            except RateLimitError:
+                continue
+            except AccountNotFoundError:
+                # ToDo: update account info
+                continue
+
+    def update_user_profile(self, account):
+
+        profile = self.get_user_profile(account.user_id)
+        account.profile_updated_datetime = datetime.datetime.now(timezone('Asia/Tokyo'))
+        account.screen_name = profile.get("screen_name", "")
+        account.name = profile.get("name", "")
+        account.description = profile.get("description", "")
+        account.followers_count = profile.get("followers_count", 0)
+        account.friends_count = profile.get("friends_count", 0)
+        account.location = profile.get("location", "")
+        account.created_at = profile.get("created_at", "")
+
+    def update_user_profiles(self):
+        pass
+
+    def send_direct_message(self):
+        pass
