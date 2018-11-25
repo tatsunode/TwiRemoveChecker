@@ -207,7 +207,8 @@ class Command(BaseCommand):
         res = self.twitter_session.post(endpoint, json=data, headers=headers)
 
         if res.status_code == 200:
-            self.api_limit_dm = int(res.headers["x-rate-limit-remaining"])
+            # self.api_limit_dm = int(res.headers["x-rate-limit-remaining"])
+            pass
         elif res.status_code == 429:
             self.api_limit_dm = 0
             raise RateLimitError
