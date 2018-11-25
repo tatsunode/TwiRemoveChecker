@@ -61,7 +61,6 @@ class Command(BaseCommand):
 
         if res.status_code == 200:
             response = json.loads(res.text)
-            print(response)
             return response["id"]
         else:
             raise ValueError("API failed: status code: " + str(res.statsu_code))
