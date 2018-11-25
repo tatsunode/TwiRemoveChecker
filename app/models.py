@@ -18,6 +18,8 @@ class Account(models.Model):
     location = models.CharField('Location', max_length=255, blank=True, null=True)
     created_at = models.CharField('created_at', max_length=255, blank=True, null=True)
 
+    deleted = models.BooleanField("Deleted", default=False)
+
     def __str__(self):
         return str(self.screen_name)
 

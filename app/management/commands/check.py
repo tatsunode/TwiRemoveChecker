@@ -1,25 +1,17 @@
 # -*- coding: utf-8 -*-
-import os, datetime, time, sys
+import os, datetime, time, sys, json
 from pytz import timezone
 from django.core.management.base import BaseCommand
 from app.models import Account, Key
 from requests_oauthlib import OAuth1Session
 
+
 class RateLimitError(Exception):
     """ """
 
+
 class AccountNotFoundError(Exception):
     """ """
-
-def send_dm(api, my_account, account, is_new_user):
-
-    message = ""
-    if is_new_user:
-        message = "[new user] " + str(account.screen_name) + " : " + str(account.name) + " : " + str(account.account_id)
-    else:
-        message = "[remove user] " + str(account.screen_name) + " : " + str(account.name) + " : " + str(account.account_id)
-    message += "\n" + "https://twitter.com/intent/user?user_id=" + str(account.account_id)
-    api.send_direct_message(user_id=my_account.id, text=message)
 
 
 class Command(BaseCommand):
@@ -30,13 +22,16 @@ class Command(BaseCommand):
         self.api_limit_id = 15 
         self.api_limit_user = 900
 
-        CK, CS, AT, ATS = self.get_keys()
+        # make sesison
+        CK, CS, AT, ATS = self.load_keys()
         self.make_twitter_session(CK, CS, AT, ATS)
+
+        self.user_id = self.get_user_id()
 
         # get current(old) user id list from db & new user id list from api
         old_id_list = self.get_old_id_list()
         # new_id_list = self.get_follower_id_list()
-        new_id_list = [1000, 3000, 4000]
+        new_id_list = [72326623, 3321361, 2827937894]
 
         print("OLD IDs:", old_id_list)
         print("NEW IDs:", new_id_list)
@@ -48,13 +43,11 @@ class Command(BaseCommand):
         self.handle_removed_accounts(removed_id_list)
         self.handle_new_accounts(new_id_list)
 
-        self.send_direct_message()
-
-        self.update_user_profiles()
+        self.update_user_profile_until_rate_limit()
 
         return
 
-    def get_keys(self):
+    def load_keys(self):
         CK = str(Key.objects.get(key='consumer_key').value)
         CS = str(Key.objects.get(key='consumer_secret').value)
         AT = str(Key.objects.get(key='access_token').value)
@@ -64,6 +57,17 @@ class Command(BaseCommand):
     def make_twitter_session(self, CK, CS, AT, ATS):
         oauth_session = OAuth1Session(CK, CS, AT, ATS)
         self.twitter_session = oauth_session
+    
+    def get_user_id(self):
+        endpoint = "https://api.twitter.com/1.1/account/verify_credentials.json"
+        res = self.twitter_session.get(endpoint)
+
+        if res.status_code == 200:
+            response = json.loads(res.text)
+            print(response)
+            return response["id"]
+        else:
+            raise ValueError("API failed: status code: " + str(res.statsu_code))
 
     def get_old_id_list(self):
         following_accounts = Account.objects.filter(followed_you=True)
@@ -78,8 +82,9 @@ class Command(BaseCommand):
         # ToDo: Cursor対応, 5000超えたら
         if res.status_code == 200:
             response_json = json.loads(res.text)
-            self.id_list = response_json["ids"]
-            self.limit = int(res.headers["x-rate-limit-remaining"])
+            id_list = response_json["ids"]
+            self.api_limit_id = int(res.headers["x-rate-limit-remaining"])
+            return id_list
         elif res.status_code == 429:
             raise RateLimitError
         else:
@@ -90,7 +95,7 @@ class Command(BaseCommand):
         params = {
             "user_id": user_id
         }
-        res = twitter.get(endpoint, params=params)
+        res = self.twitter_session.get(endpoint, params=params)
 
         if res.status_code == 200:
             response = json.loads(res.text)
@@ -112,6 +117,13 @@ class Command(BaseCommand):
             removed_account.unfollow_datetime = datetime.datetime.now(timezone('Asia/Tokyo'))
             removed_account.save()
 
+            message = "REMOVED: {} ({}) \nhttps://twitter.com/{}".format(
+                removed_account.name,
+                removed_account.screen_name,
+                removed_account.screen_name
+            )
+            self.post_direct_message(message)
+
     def handle_new_accounts(self, new_id_list):
         print("NEW:", new_id_list)
 
@@ -123,26 +135,68 @@ class Command(BaseCommand):
 
             try:
                 self.update_user_profile(new_account)
+                message = "NEW FOLLOWER: {} ({}) https://twitter.com/{}".format(
+                    new_account.name,
+                    new_account.screen_name,
+                    new_account.screen_name
+                )
+                self.post_direct_message(message)
+
             except RateLimitError:
-                continue
-            except AccountNotFoundError:
-                # ToDo: update account info
                 continue
 
     def update_user_profile(self, account):
 
-        profile = self.get_user_profile(account.user_id)
-        account.profile_updated_datetime = datetime.datetime.now(timezone('Asia/Tokyo'))
-        account.screen_name = profile.get("screen_name", "")
-        account.name = profile.get("name", "")
-        account.description = profile.get("description", "")
-        account.followers_count = profile.get("followers_count", 0)
-        account.friends_count = profile.get("friends_count", 0)
-        account.location = profile.get("location", "")
-        account.created_at = profile.get("created_at", "")
+        try:
+            profile = self.get_user_profile(account.user_id)
+            account.profile_updated_datetime = datetime.datetime.now(timezone('Asia/Tokyo'))
+            account.screen_name = profile.get("screen_name", "")
+            account.name = profile.get("name", "")
+            account.description = profile.get("description", "")
+            account.followers_count = profile.get("followers_count", 0)
+            account.friends_count = profile.get("friends_count", 0)
+            account.location = profile.get("location", "")
+            account.created_at = profile.get("created_at", "")
+            account.save()
 
-    def update_user_profiles(self):
-        pass
+        except AccountNotFoundError:
+            account.profile_updated_datetime = datetime.datetime.now(timezone('Asia/Tokyo'))
+            account.deleted = True
+            account.followed_you = False
+            account.save()
 
-    def send_direct_message(self):
-        pass
+    def update_user_profile_until_rate_limit(self):
+
+        accounts = Account.objects.filter(deleted=False).order_by("-profile_updated_datetime")
+        for account in accounts:
+            try:
+                self.update_user_profile(account)
+            except RateLimitError:
+                break
+
+    def post_direct_message(self, message):
+        endpoint = "https://api.twitter.com/1.1/direct_messages/events/new.json"
+        data = {
+            "event": {
+                "type": "message_create",
+                "message_create": {
+                    "target": {
+                        "recipient_id": self.user_id,
+                    },
+                    "message_data": {
+                        "text": message
+                    }
+                }
+            }
+        }
+        headers = {
+            "content-type": "application/json"
+        }
+        res = self.twitter_session.post(endpoint, json=data, headers=headers)
+
+        if res.status_code == 200:
+            pass
+        elif res.status_code == 429:
+            raise RateLimitError
+        else:
+            raise ValueError("API failed: status code: " + str(res.status_code))
